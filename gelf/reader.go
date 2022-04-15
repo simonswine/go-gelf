@@ -14,11 +14,19 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	maxMessageTimeout         = 5 * time.Second
+	assemblersCleanUpInterval = 5 * time.Second
 )
 
 type Reader struct {
-	mu   sync.Mutex
-	conn net.Conn
+	mu              sync.Mutex
+	conn            net.Conn
+	chunkAssemblers map[string]*assembler
+	done            chan struct{}
 }
 
 func NewReader(addr string) (*Reader, error) {
@@ -35,6 +43,9 @@ func NewReader(addr string) (*Reader, error) {
 
 	r := new(Reader)
 	r.conn = conn
+	r.chunkAssemblers = make(map[string]*assembler)
+	r.done = make(chan struct{})
+	r.initAssemblersCleanup()
 	return r, nil
 }
 
@@ -64,67 +75,51 @@ func (r *Reader) Read(p []byte) (int, error) {
 func (r *Reader) ReadMessage() (*Message, error) {
 	cBuf := make([]byte, ChunkSize)
 	var (
-		err        error
-		n, length  int
-		cid, ocid  []byte
-		seq, total uint8
-		cHead      []byte
-		cReader    io.Reader
-		chunks     [][]byte
+		err       error
+		n         int
+		chunkHead []byte
+		cReader   io.Reader
 	)
+	var message []byte
 
-	for got := 0; got < 128 && (total == 0 || got < int(total)); got++ {
+	for {
 		if n, err = r.conn.Read(cBuf); err != nil {
 			return nil, fmt.Errorf("Read: %s", err)
 		}
-		cHead, cBuf = cBuf[:2], cBuf[:n]
-
-		if bytes.Equal(cHead, magicChunked) {
-			// fmt.Printf("chunked %v\n", cBuf[:14])
-			cid, seq, total = cBuf[2:2+8], cBuf[2+8], cBuf[2+8+1]
-			if ocid != nil && !bytes.Equal(cid, ocid) {
-				return nil, fmt.Errorf("out-of-band message %v (awaited %v)", cid, ocid)
-			} else if ocid == nil {
-				ocid = cid
-				chunks = make([][]byte, total)
+		chunkHead, cBuf = cBuf[:2], cBuf[:n]
+		if bytes.Equal(chunkHead, magicChunked) {
+			messageID := string(cBuf[2 : 2+8])
+			assembler := getAssembler(r, messageID)
+			if assembler.processed >= MaxChunksCount {
+				return nil, fmt.Errorf("too many chunks count for messageID: %v (max count %v)", messageID, MaxChunksCount)
 			}
-			n = len(cBuf) - chunkedHeaderLen
-			// fmt.Printf("setting chunks[%d]: %d\n", seq, n)
-			chunks[seq] = append(make([]byte, 0, n), cBuf[chunkedHeaderLen:]...)
-			length += n
-		} else { // not chunked
-			if total > 0 {
-				return nil, fmt.Errorf("out-of-band message (not chunked)")
+			if assembler.Expired() {
+				return nil, fmt.Errorf("message with ID: %v is expired", messageID)
 			}
-			break
+			if messageCompleted := assembler.Update(cBuf); !messageCompleted {
+				continue
+			}
+			message = assembler.Bytes()
+			chunkHead = message[:2]
+			delete(r.chunkAssemblers, messageID)
+		} else {
+			message = cBuf
 		}
-	}
-	// fmt.Printf("\nchunks: %v\n", chunks)
-
-	if length > 0 {
-		if cap(cBuf) < length {
-			cBuf = append(cBuf, make([]byte, 0, length-cap(cBuf))...)
-		}
-		cBuf = cBuf[:0]
-		for i := range chunks {
-			// fmt.Printf("appending %d %v\n", i, chunks[i])
-			cBuf = append(cBuf, chunks[i]...)
-		}
-		cHead = cBuf[:2]
+		break
 	}
 
 	// the data we get from the wire is compressed
-	if bytes.Equal(cHead, magicGzip) {
-		cReader, err = gzip.NewReader(bytes.NewReader(cBuf))
-	} else if cHead[0] == magicZlib[0] &&
-		(int(cHead[0])*256+int(cHead[1]))%31 == 0 {
+	if bytes.Equal(chunkHead, magicGzip) {
+		cReader, err = gzip.NewReader(bytes.NewReader(message))
+	} else if chunkHead[0] == magicZlib[0] &&
+		(int(chunkHead[0])*256+int(chunkHead[1]))%31 == 0 {
 		// zlib is slightly more complicated, but correct
-		cReader, err = zlib.NewReader(bytes.NewReader(cBuf))
+		cReader, err = zlib.NewReader(bytes.NewReader(message))
 	} else {
 		// compliance with https://github.com/Graylog2/graylog2-server
 		// treating all messages as uncompressed if  they are not gzip, zlib or
 		// chunked
-		cReader = bytes.NewReader(cBuf)
+		cReader = bytes.NewReader(message)
 	}
 
 	if err != nil {
@@ -139,6 +134,41 @@ func (r *Reader) ReadMessage() (*Message, error) {
 	return msg, nil
 }
 
+func getAssembler(r *Reader, messageID string) *assembler {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	assembler, ok := r.chunkAssemblers[messageID]
+	if !ok {
+		assembler = newAssembler(maxMessageTimeout)
+		r.chunkAssemblers[messageID] = assembler
+	}
+	return assembler
+}
+
 func (r *Reader) Close() error {
+	close(r.done)
 	return r.conn.Close()
+}
+
+func (r *Reader) initAssemblersCleanup() {
+	go func() {
+		for {
+			select {
+			case <-r.done:
+				return
+			case <-time.After(assemblersCleanUpInterval):
+				cleanUpExpiredAssemblers(r)
+			}
+		}
+	}()
+}
+
+func cleanUpExpiredAssemblers(r *Reader) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for messageID, assembler := range r.chunkAssemblers {
+		if assembler.Expired() {
+			delete(r.chunkAssemblers, messageID)
+		}
+	}
 }
