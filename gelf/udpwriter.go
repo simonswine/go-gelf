@@ -42,7 +42,9 @@ const (
 	ChunkSize        = 1420
 	chunkedHeaderLen = 12
 	chunkedDataLen   = ChunkSize - chunkedHeaderLen
-	maxChunksCount   = 128
+	// maxChunksCount is limited by the protocol to a maximum of 128
+	// https://docs.graylog.org/docs/gelf#gelf-via-udp
+	maxChunksCount = 128
 )
 
 var (

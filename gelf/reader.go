@@ -98,7 +98,8 @@ func (r *Reader) ReadMessage() (*Message, error) {
 	var message []byte
 
 	for {
-		cBuf = make([]byte, ChunkSize)
+		// we need to reset buffer length because we change the length of the buffer to `n` after the reading data from connection
+		cBuf = cBuf[:ChunkSize]
 		if n, err = r.conn.Read(cBuf); err != nil {
 			return nil, fmt.Errorf("Read: %s", err)
 		}
@@ -180,13 +181,13 @@ func (r *Reader) initDefragmentatorsCleanup(defarmentatorsCleanUpInterval time.D
 			case <-r.done:
 				return
 			case <-time.After(defarmentatorsCleanUpInterval):
-				cleanUpExpiredDefragmentators(r)
+				r.cleanUpExpiredDefragmentators()
 			}
 		}
 	}()
 }
 
-func cleanUpExpiredDefragmentators(r *Reader) {
+func (r *Reader) cleanUpExpiredDefragmentators() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for messageID, defragmentator := range r.messageDefragmentators {

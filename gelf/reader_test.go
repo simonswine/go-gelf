@@ -17,15 +17,18 @@ import (
 
 func TestReader(t *testing.T) {
 	notChunked := createMessage("a", 10)
-	notChunkedBytes := prepareUdpMessages(t, notChunked)
+	notChunkedBytes := prepareUDPMessages(t, notChunked)
 	//message that is sent in 2 chunks
 	chunked1 := createMessage("b", ChunkSize+1)
-	chunkedBytes1 := prepareUdpMessages(t, chunked1)
+	chunkedBytes1 := prepareUDPMessages(t, chunked1)
 	//message that is sent in 3 chunks
 	chunked2 := createMessage("c", ChunkSize*2)
-	chunkedBytes2 := prepareUdpMessages(t, chunked2)
+	chunkedBytes2 := prepareUDPMessages(t, chunked2)
 	//message that is sent in 129 chunks
-	messageBytes3 := prepareUdpMessages(t, createMessage("d", chunkedDataLen*128))
+	messageBytes3 := prepareUDPMessages(t, createMessage("d", chunkedDataLen*128))
+	//message that is sent in 128 chunks
+	chunked4 := createMessage("e", chunkedDataLen*127)
+	chunkedBytes4 := prepareUDPMessages(t, chunked4)
 
 	tests := map[string]struct {
 		udpMessagesToSend [][]byte
@@ -56,6 +59,10 @@ func TestReader(t *testing.T) {
 			udpMessagesToSend: messageBytes3,
 			expectedErrors:    []error{fmt.Errorf("message must not be split into more than %v chunks", maxChunksCount)},
 		},
+		"expected messages to be received even if it's split into 128 chunks": {
+			udpMessagesToSend: chunkedBytes4,
+			expectedMessages:  []Message{chunked4},
+		},
 	}
 
 	for name, data := range tests {
@@ -63,16 +70,18 @@ func TestReader(t *testing.T) {
 			reader, err := NewReader(":0")
 			require.NoError(t, err)
 			done := make(chan bool)
-			defer reader.Close()
+			defer func() {
+				_ = reader.Close()
+			}()
 			defer close(done)
 
 			addr, err := net.ResolveUDPAddr("udp", reader.Addr())
 			require.NoError(t, err)
-
 			conn, err := net.DialUDP("udp", nil, addr)
-			defer conn.Close()
-
 			require.NoError(t, err)
+			defer func() {
+				_ = conn.Close()
+			}()
 
 			receivedMessages := make([]Message, 0, len(data.expectedMessages))
 			errors := make([]error, 0)
@@ -136,7 +145,7 @@ func createMessage(char string, originMessageLength int) Message {
 	}
 }
 
-func prepareUdpMessages(t *testing.T, message Message) [][]byte {
+func prepareUDPMessages(t *testing.T, message Message) [][]byte {
 	enc, err := json.Marshal(message)
 	if err != nil {
 		t.Fatal(err)
@@ -175,17 +184,22 @@ func TestReaderCleaningProcess(t *testing.T) {
 
 	reader, err := newReader(":0", maxMessageTimeout, defarmentatorsCleanUpInterval)
 	require.NoError(t, err)
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 
 	addr, err := net.ResolveUDPAddr("udp", reader.Addr())
 	require.NoError(t, err)
 
 	conn, err := net.DialUDP("udp", nil, addr)
-	defer conn.Close()
+	require.NoError(t, err)
+	defer func() {
+		_ = conn.Close()
+	}()
 
-	notChunkedMessage := prepareUdpMessages(t, createMessage("a", 10))[0]
+	notChunkedMessage := prepareUDPMessages(t, createMessage("a", 10))[0]
 	//message that is split to 2 chunks
-	chunks := prepareUdpMessages(t, createMessage("b", ChunkSize+1))
+	chunks := prepareUDPMessages(t, createMessage("b", ChunkSize+1))
 	// we write only one chunk so the message will be abandoned in defragmentator
 	n, err := conn.Write(chunks[0])
 	require.Equal(t, len(chunks[0]), n)
