@@ -39,10 +39,10 @@ const (
 //
 // TODO: generate dynamically using Path MTU Discovery?
 const (
-	MaxChunksCount   = 128
 	ChunkSize        = 1420
 	chunkedHeaderLen = 12
 	chunkedDataLen   = ChunkSize - chunkedHeaderLen
+	maxChunksCount   = 128
 )
 
 var (
@@ -91,8 +91,8 @@ func (w *GelfWriter) writeChunked(zBytes []byte) (err error) {
 	b := make([]byte, 0, ChunkSize)
 	buf := bytes.NewBuffer(b)
 	nChunksI := numChunks(zBytes)
-	if nChunksI > MaxChunksCount {
-		return fmt.Errorf("msg too large, would need %d chunks", nChunksI)
+	if nChunksI > maxChunksCount {
+		return fmt.Errorf("msg too large, would need %d chunks which execeeds the limit of %d chunks", nChunksI, maxChunksCount)
 	}
 	nChunks := uint8(nChunksI)
 	// use urandom to get a unique message id

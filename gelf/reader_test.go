@@ -8,177 +8,212 @@ import (
 	"math/rand"
 	"net"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	kSourceCount  = 10
-	kMsgPerSource = 100
-	kMaxMsgLength = 3000
-	kChunkSplit   = 1024
-
-	kSleep = 1
-)
-
 func TestReader(t *testing.T) {
-	reader, err := NewReader(":0")
-	defer reader.Close()
-	if err != nil {
-		t.Fatal(err)
+	notChunked := createMessage("a", 10)
+	notChunkedBytes := prepareUdpMessages(t, notChunked)
+	//message that is sent in 2 chunks
+	chunked1 := createMessage("b", ChunkSize+1)
+	chunkedBytes1 := prepareUdpMessages(t, chunked1)
+	//message that is sent in 3 chunks
+	chunked2 := createMessage("c", ChunkSize*2)
+	chunkedBytes2 := prepareUdpMessages(t, chunked2)
+	//message that is sent in 129 chunks
+	messageBytes3 := prepareUdpMessages(t, createMessage("d", chunkedDataLen*128))
+
+	tests := map[string]struct {
+		udpMessagesToSend [][]byte
+		expectedMessages  []Message
+		expectedErrors    []error
+	}{
+		"expected messages to be received even if chunked messages are received in parallel": {
+			udpMessagesToSend: [][]byte{chunkedBytes1[0], chunkedBytes2[0], chunkedBytes2[1], chunkedBytes1[1], chunkedBytes2[2]},
+			expectedMessages:  []Message{chunked1, chunked2},
+		},
+		"expected message to be received even if chunks are sent in any order": {
+			udpMessagesToSend: [][]byte{chunkedBytes2[1], chunkedBytes2[0], chunkedBytes2[2]},
+			expectedMessages:  []Message{chunked2},
+		},
+		"expected messages to be received even if not chunked message is sent between chunks": {
+			udpMessagesToSend: [][]byte{chunkedBytes1[0], notChunkedBytes[0], chunkedBytes1[1]},
+			expectedMessages:  []Message{chunked1, notChunked},
+		},
+		"expected not chunked messages to be received": {
+			udpMessagesToSend: [][]byte{notChunkedBytes[0], notChunkedBytes[0]},
+			expectedMessages:  []Message{notChunked, notChunked},
+		},
+		"expected error if chunked message length is not greater than 12 bytes": {
+			udpMessagesToSend: [][]byte{magicChunked},
+			expectedErrors:    []error{fmt.Errorf("chunked message size must be greather than 12")},
+		},
+		"expected error if message is split to more than 128 chunks": {
+			udpMessagesToSend: messageBytes3,
+			expectedErrors:    []error{fmt.Errorf("message must not be split into more than %v chunks", maxChunksCount)},
+		},
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", reader.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			reader, err := NewReader(":0")
+			require.NoError(t, err)
+			done := make(chan bool)
+			defer reader.Close()
+			defer close(done)
 
-	t.Logf("Listening on %s", addr)
+			addr, err := net.ResolveUDPAddr("udp", reader.Addr())
+			require.NoError(t, err)
 
-	var sentplain, sentchunk, refused, received, recok, recerr, recpanic int32
-
-	g, _ := errgroup.WithContext(context.Background())
-	for i := 0; i < kSourceCount; i++ {
-		i := i
-
-		t.Logf("Starting source %d", i)
-		conn, err := net.DialUDP("udp", nil, addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		g.Go(func() error {
-			defer t.Logf("End source %d", i)
+			conn, err := net.DialUDP("udp", nil, addr)
 			defer conn.Close()
 
-			c := string(rune('a' + i))
-			for i := 0; i < kMsgPerSource; i++ {
-				clen := rand.Intn(kMaxMsgLength)
-				str := strings.Repeat(c, clen)
+			require.NoError(t, err)
 
-				msg := map[string]interface{}{
-					"version":       "1.1",
-					"timestamp":     0.0,
-					"host":          "test",
-					"short_message": str,
-
-					"_char": c,
-					"_len":  clen,
-				}
-
-				enc, err := json.Marshal(msg)
-				if err != nil {
-					return err
-				}
-
-				if len(enc) > kChunkSplit {
-					msgId := make([]byte, 8)
-					if n, err := rand.Read(msgId); err != nil || len(msgId) != n {
-						return err
-					}
-
-					for chunk := 0; chunk*kChunkSplit < len(enc); chunk++ {
-						start := chunk * kChunkSplit
-						end := (chunk + 1) * kChunkSplit
-						if end > len(enc) {
-							end = len(enc)
-						}
-
-						payload := bytes.NewBuffer([]byte{0x1e, 0x0f})
-						payload.Write(msgId)
-						payload.Write([]byte{uint8(chunk)})
-						payload.Write([]byte{uint8(len(enc)/kChunkSplit) + 1})
-						payload.Write(enc[start:end])
-
-						if _, err := conn.Write(payload.Bytes()); err != nil {
-							atomic.AddInt32(&refused, 1)
-						}
-					}
-
-					time.Sleep(kSleep * time.Millisecond)
-					atomic.AddInt32(&sentchunk, 1)
-					continue
-				}
-
-				if _, err := conn.Write(enc); err != nil {
-					atomic.AddInt32(&refused, 1)
-				}
-
-				time.Sleep(kSleep * time.Millisecond)
-				atomic.AddInt32(&sentplain, 1)
-			}
-			return nil
-		})
-	}
-
-	g.Go(func() error {
-		cmsg := make(chan *Message, 1)
-		cerr := make(chan error, 1)
-
-		timer := time.NewTimer(0)
-
-		for {
+			receivedMessages := make([]Message, 0, len(data.expectedMessages))
+			errors := make([]error, 0)
+			g, _ := errgroup.WithContext(context.Background())
+			messagesChannel := make(chan Message)
+			errorsChannel := make(chan error)
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
-						atomic.AddInt32(&received, 1)
-						atomic.AddInt32(&recpanic, 1)
-						cerr <- fmt.Errorf("panic: %s", r)
+						errorsChannel <- fmt.Errorf("panic during execution: %v", r)
 					}
 				}()
-
-				msg, err := reader.ReadMessage()
-				atomic.AddInt32(&received, 1)
-				if err != nil {
-					cerr <- err
-				} else {
-					cmsg <- msg
+				for {
+					select {
+					case <-done:
+						return
+					default:
+						msg, err := reader.ReadMessage()
+						if err != nil {
+							errorsChannel <- err
+						} else {
+							messagesChannel <- *msg
+						}
+					}
 				}
 			}()
-
-			if !timer.Stop() {
-				<-timer.C
+			g.Go(func() error {
+				for {
+					select {
+					case <-time.After(1 * time.Second):
+						return nil
+					case msg := <-messagesChannel:
+						receivedMessages = append(receivedMessages, msg)
+					case err := <-errorsChannel:
+						errors = append(errors, err)
+					}
+				}
+			})
+			for _, message := range data.udpMessagesToSend {
+				if _, err := conn.Write(message); err != nil {
+					t.Fatal(err)
+				}
 			}
-			timer.Reset(1 * time.Second)
-			select {
-			case msg := <-cmsg:
-				c, ok := msg.Extra["_char"].(string)
-				if !ok || len(c) != 1 {
-					atomic.AddInt32(&recerr, 1)
-					t.Errorf("invalid char")
-					continue
-				}
+			require.NoError(t, g.Wait())
+			require.ElementsMatch(t, data.expectedErrors, errors)
+			require.ElementsMatch(t, data.expectedMessages, receivedMessages)
+		})
+	}
 
-				clen, ok := msg.Extra["_len"].(float64)
-				if !ok || clen < 0 {
-					atomic.AddInt32(&recerr, 1)
-					t.Errorf("invalid len")
-					continue
-				}
+}
 
-				if msg.Short != strings.Repeat(c, int(clen)) {
-					atomic.AddInt32(&recerr, 1)
-					t.Error("msg does not match")
-					continue
-				}
+func createMessage(char string, originMessageLength int) Message {
+	return Message{
+		Version:  "1.1",
+		Host:     "hostname",
+		Short:    strings.Repeat(char, originMessageLength),
+		TimeUnix: float64(time.Now().UnixNano()) / float64(time.Second),
+		Level:    6, // info
+		Facility: "reader_test",
+		Extra:    nil,
+	}
+}
 
-				atomic.AddInt32(&recok, 1)
-			case err := <-cerr:
-				atomic.AddInt32(&recerr, 1)
-				t.Error(err)
-			case <-timer.C:
-				return nil
-			}
-		}
-	})
-
-	if err := g.Wait(); err != nil {
+func prepareUdpMessages(t *testing.T, message Message) [][]byte {
+	enc, err := json.Marshal(message)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("%d sent (%d plain, %d chunked), %d refused, %d received, (%d OK, %d errors, %d panics)",
-		sentplain+sentchunk, sentplain, sentchunk, refused, received, recok, recerr, recpanic)
+	if len(enc) <= ChunkSize {
+		return [][]byte{enc}
+	}
 
+	chunksCount := uint8(len(enc)/chunkedDataLen) + 1
+	udpMessages := make([][]byte, 0, chunksCount)
+	msgId := make([]byte, 8)
+	if n, err := rand.Read(msgId); err != nil || len(msgId) != n {
+		t.Fatal(err)
+	}
+
+	for chunk := 0; chunk*chunkedDataLen < len(enc); chunk++ {
+		start := chunk * chunkedDataLen
+		end := (chunk + 1) * chunkedDataLen
+		if end > len(enc) {
+			end = len(enc)
+		}
+
+		payload := bytes.NewBuffer([]byte{0x1e, 0x0f})
+		payload.Write(msgId)
+		payload.Write([]byte{uint8(chunk)})
+		payload.Write([]byte{chunksCount})
+		payload.Write(enc[start:end])
+		udpMessages = append(udpMessages, payload.Bytes())
+	}
+	return udpMessages
+}
+
+func TestReaderCleaningProcess(t *testing.T) {
+	maxMessageTimeout := 200 * time.Millisecond
+	defarmentatorsCleanUpInterval := 50 * time.Millisecond
+
+	reader, err := newReader(":0", maxMessageTimeout, defarmentatorsCleanUpInterval)
+	require.NoError(t, err)
+	defer reader.Close()
+
+	addr, err := net.ResolveUDPAddr("udp", reader.Addr())
+	require.NoError(t, err)
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	defer conn.Close()
+
+	notChunkedMessage := prepareUdpMessages(t, createMessage("a", 10))[0]
+	//message that is split to 2 chunks
+	chunks := prepareUdpMessages(t, createMessage("b", ChunkSize+1))
+	// we write only one chunk so the message will be abandoned in defragmentator
+	n, err := conn.Write(chunks[0])
+	require.Equal(t, len(chunks[0]), n)
+	require.NoError(t, err)
+
+	// we write not chunked message to unblock the reader
+	n, err = conn.Write(notChunkedMessage)
+	require.NoError(t, err)
+	require.Equal(t, len(notChunkedMessage), n)
+
+	_, err = reader.ReadMessage()
+	require.NoError(t, err)
+
+	messageID := string(getMessageId(chunks[0]))
+	require.Truef(t, containsDefragmentator(reader, messageID), "reader must contain defragmentator for messageID: %v", messageID)
+
+	require.Eventually(t, func() bool {
+		return !containsDefragmentator(reader, messageID)
+	}, 2*time.Second, 50*time.Millisecond, "defragmentator must be removed")
+}
+
+func getMessageId(chunk []byte) []byte {
+	return chunk[2:10]
+}
+
+func containsDefragmentator(reader *Reader, messageID string) bool {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	_, exists := reader.messageDefragmentators[messageID]
+	return exists
 }
