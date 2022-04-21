@@ -2,7 +2,6 @@ package gelf
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 )
 
 func TestReader(t *testing.T) {
@@ -73,7 +71,6 @@ func TestReader(t *testing.T) {
 			defer func() {
 				_ = reader.Close()
 			}()
-			defer close(done)
 
 			addr, err := net.ResolveUDPAddr("udp", reader.Addr())
 			require.NoError(t, err)
@@ -83,16 +80,17 @@ func TestReader(t *testing.T) {
 				_ = conn.Close()
 			}()
 
-			receivedMessages := make([]Message, 0, len(data.expectedMessages))
 			errors := make([]error, 0)
-			g, _ := errgroup.WithContext(context.Background())
-			messagesChannel := make(chan Message)
-			errorsChannel := make(chan error)
+			receivedMessages := make([]Message, 0, len(data.expectedMessages))
+
+			messagesOutstanding := len(data.expectedErrors) + len(data.expectedMessages)
+
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
-						errorsChannel <- fmt.Errorf("panic during execution: %v", r)
+						errors = append(errors, fmt.Errorf("panic during execution: %v", r))
 					}
+					close(done)
 				}()
 				for {
 					select {
@@ -100,32 +98,25 @@ func TestReader(t *testing.T) {
 						return
 					default:
 						msg, err := reader.ReadMessage()
+						t.Logf("read message %v", msg)
 						if err != nil {
-							errorsChannel <- err
+							errors = append(errors, err)
 						} else {
-							messagesChannel <- *msg
+							receivedMessages = append(receivedMessages, *msg)
+						}
+						messagesOutstanding -= 1
+						if messagesOutstanding == 0 {
+							return
 						}
 					}
 				}
 			}()
-			g.Go(func() error {
-				for {
-					select {
-					case <-time.After(1 * time.Second):
-						return nil
-					case msg := <-messagesChannel:
-						receivedMessages = append(receivedMessages, msg)
-					case err := <-errorsChannel:
-						errors = append(errors, err)
-					}
-				}
-			})
 			for _, message := range data.udpMessagesToSend {
 				if _, err := conn.Write(message); err != nil {
 					t.Fatal(err)
 				}
 			}
-			require.NoError(t, g.Wait())
+			<-done
 			require.ElementsMatch(t, data.expectedErrors, errors)
 			require.ElementsMatch(t, data.expectedMessages, receivedMessages)
 		})
